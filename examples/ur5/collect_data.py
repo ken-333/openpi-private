@@ -77,9 +77,9 @@ def read_cameras(cameras):
         
 
 # TODO 7: def connect_gripper()
-#   连接夹爪 (先留空, 写 pass, 后面再填)
-def connect_gripper():
-    pass
+#   连接夹爪 
+def connect_gripper():    
+    pass    
 
 # TODO 8: def set_gripper(position)
 #   控制夹爪开合 (先留空, 写 pass)
