@@ -80,12 +80,6 @@ def read_cameras(cameras):
     return frames
         
 
-<<<<<<< HEAD
-# TODO 7: def connect_gripper()
-#   连接夹爪 
-def connect_gripper():    
-    pass    
-=======
 def _gripper_cmd(sock, cmd):
     sock.sendall((cmd + "\n").encode())
     return sock.recv(1024).decode().strip()
@@ -107,7 +101,6 @@ def connect_gripper():
     print("Gripper connected and activated")
     return sock
     
->>>>>>> 9e1ef5a44ae22b7856cdf4f82c4a86b7807da066
 
 # TODO 8: def set_gripper(position)
 #   控制夹爪开合 (先留空, 写 pass)
