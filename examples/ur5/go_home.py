@@ -25,10 +25,15 @@ def main():
 
     print("Connecting to robot...")
     rc = rtde_control.RTDEControlInterface(ROBOT_IP)
-    print(f"Moving to home: {HOME_JOINTS_DEG} deg")
-    rc.moveJ(home_rad, SPEED, ACCEL)
-    print("Done.")
-    rc.disconnect()
+    try:
+        print(f"Moving to home: {HOME_JOINTS_DEG} deg")
+        rc.moveJ(home_rad, SPEED, ACCEL)
+        print("Done.")
+    finally:
+        # Always release the control script, even on Ctrl+C/error — otherwise it
+        # keeps running on the controller and the next run times out on connect.
+        rc.stopScript()
+        rc.disconnect()
 
 
 if __name__ == "__main__":
