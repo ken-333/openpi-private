@@ -21,7 +21,7 @@ import time
 
 
 ROBOT_IP = "192.168.0.101"
-CONTROL_HZ = 100
+CONTROL_HZ = 125
 SPACEMOUSE_DEADZONE = 0.05
 GRIPPER_PORT = 63352   # Robotiq URCap text protocol over socket
 
@@ -31,8 +31,8 @@ GRIPPER_PORT = 63352   # Robotiq URCap text protocol over socket
 # Flip a sign (+1/-1) if an axis moves the wrong way; swap the assignments in
 # map_to_velocity() if two axes are interchanged.
 AXIS_SIGN = {
-    "x": +1, "y": +1, "z": +1,
-    "roll": +1, "pitch": +1, "yaw": +1,
+    "x": +2, "y": +2, "z": +2,
+    "roll": +2, "pitch": +2, "yaw": +2,
 }
 TRANS_SCALE = 0.1   # translation: m/s at full SpaceMouse deflection
 ROT_SCALE   = 0.1   # rotation:    rad/s at full SpaceMouse deflection

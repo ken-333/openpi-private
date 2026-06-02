@@ -18,17 +18,26 @@ import cv2
 import h5py # 用于保存数据的 HDF5 文件格式库，适合存储大量结构化数据，如图像和关节状态等。
 import numpy as np
 import time
-from pathlib import Path 
+import threading
+from pathlib import Path
 import socket
 import os
 
 
 ROBOT_IP = "192.168.0.101"             # change to your robot's IP
-CONTROL_HZ = 20                        # control loop frequency
+CONTROL_HZ = 150                       # motion command rate (speedL) — high = smooth
+RECORD_HZ = 30                         # preview + episode recording rate (~camera fps)
 SAVE_DIR = Path("./collected_data")    # directory to save episodes
-SPACEMOUSE_SCALE = 0.1                 # scale factor for SpaceMouse input to velocity
 SPACEMOUSE_DEADZONE = 0.05             # threshold for noise cancellation
 GRIPPER_PORT = 63352
+
+# Motion control mapping (tuned in teleop_ur5.py)
+AXIS_SIGN = {
+    "x": +1, "y": +1, "z": +1,
+    "roll": +2, "pitch": + 2, "yaw": +2,
+}
+TRANS_SCALE = 0.1   # translation: m/s at full SpaceMouse deflection
+ROT_SCALE   = 0.1   # rotation:    rad/s at full SpaceMouse deflection
 
 # 3: def apply_deadzone(state, threshold)
 #   输入: SpaceMouse 原始 6D 向量, 阈值
@@ -37,6 +46,21 @@ def apply_deadzone(state, threshold):
     state = np.array(state)
     state[np.abs(state) < threshold] =0 # 将小于阈值的分量清零
     return state
+
+
+def map_to_velocity(state):
+    raw = np.array([
+        AXIS_SIGN["x"]     * state.x,
+        AXIS_SIGN["y"]     * state.y,
+        AXIS_SIGN["z"]     * state.z,
+        AXIS_SIGN["roll"]  * state.roll,
+        AXIS_SIGN["pitch"] * state.pitch,
+        AXIS_SIGN["yaw"]   * state.yaw,
+    ])
+    raw = apply_deadzone(raw, SPACEMOUSE_DEADZONE)
+    raw[:3] *= TRANS_SCALE
+    raw[3:] *= ROT_SCALE
+    return raw
 
 # 4: def connect_robot(ip)  创建一个到机器人的网络连接，并封装成对象
 #   创建并返回 rtde_control 和 rtde_receive 两个接口对象
@@ -51,8 +75,8 @@ def connect_robot(ip):
 #   返回一个 dict: {"base": cap0, "wrist": cap1}
 def connect_cameras():
     camera = {
-        "base": cv2.VideoCapture(4),   # RealSense color stream (YUYV)
-        "wrist": cv2.VideoCapture(16)  # RealSense color stream (YUYV)
+        "base": cv2.VideoCapture(22),   # RealSense color stream (YUYV)
+        "wrist": cv2.VideoCapture(10)  # RealSense color stream (YUYV)
     }                                  #为何用dict？因为有两个摄像头，使用dict可以更清晰地管理它们，并通过键名访问对应的摄像头对象。
     for cap in camera.values():
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep only newest frame → less lag
@@ -78,7 +102,49 @@ def read_cameras(cameras):
         else:
             frames[cam_name] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     return frames
-        
+
+
+class CameraReader:
+    """Grabs the newest frame from each camera in a background thread, so the
+    control loop never blocks on cap.read(). Control loop just reads the buffer."""
+
+    def __init__(self, cameras):
+        self.cameras = cameras              # {"base": cap, "wrist": cap}
+        self.lock = threading.Lock()        # protects self.latest (shared buffer)
+        self.latest = {}                    # newest RGB frame per camera
+        self.running = False
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+
+    def _loop(self):
+        # Runs on its own thread: keep grabbing frames as fast as the cameras allow.
+        while self.running:
+            for name, cap in self.cameras.items():
+                ret, frame = cap.read()                  # blocking, but only HERE
+                if ret:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    with self.lock:
+                        self.latest[name] = rgb
+
+    def start(self):
+        self.running = True
+        self.thread.start()
+        # wait until every camera has produced at least one frame
+        while True:
+            with self.lock:
+                if self.latest.keys() == self.cameras.keys():
+                    break
+            time.sleep(0.01)
+        return self
+
+    def read(self):
+        # Instant: hand back the most recent frames (no camera I/O here).
+        with self.lock:
+            return dict(self.latest)
+
+    def stop(self):
+        self.running = False
+        self.thread.join(timeout=1.0)
+
 
 def _gripper_cmd(sock, cmd):
     sock.sendall((cmd + "\n").encode())
@@ -177,69 +243,64 @@ class EpisodeRecorder:
 #     - recorder.add_frame(...)
 #     - 处理键盘/按钮输入 (save / discard / quit)
 #     - 控制频率 (time.sleep)
-def run_collection_loop(robot_c, robot_r, cameras, gripper, recorder, task_instruction):
+def run_collection_loop(robot_c, robot_r, cam_reader, gripper, recorder, task_instruction):
     with pyspacemouse.open() as device:
-        acceleration = 2.0                  # 加速度 m/s^2 (要够大才能在一帧内达到目标速度)
-        dt = 1.0 / CONTROL_HZ               # 每帧时间间隔
-        speed_time = 2 * dt                 # speedL 持续时间, 略大于循环周期, 命令间不会刹停
+        acceleration = 0.5                  # 加速度 m/s^2 (在 teleop_ur5.py 中调好)
+        speed_time = 0.1                    # speedL 持续时间
+        dt = 1.0 / CONTROL_HZ               # 控制循环节流
+        record_every = max(1, round(CONTROL_HZ / RECORD_HZ))  # 每 N 圈记录/预览一次
         episode_number = 0
         is_recording = False
         gripper_state = 0.0
+        prev_buttons = [False, False]   # edge detection: fire gripper once per press
+        loop_count = 0
         while True:
-            # 1. read SpaceMouse input
-            state = device.read() # 偏移量是相对于上次读取的增量，初始状态为0，持续按一个方向会不断累积增大，松开后会回到0。它反映了用户对 SpaceMouse 的操作力度和方向。
-        
-            # 2. apply deadzone and scale
-            velocity = apply_deadzone([state.x, state.y, state.z, state.roll, state.pitch, state.yaw], SPACEMOUSE_DEADZONE) * SPACEMOUSE_SCALE
-
-            # 3. send velocity command to robot
+            # ---- motion path: runs EVERY loop at CONTROL_HZ (keep it lean!) ----
+            state = device.read()
+            velocity = map_to_velocity(state)
             robot_c.speedL(velocity.tolist(), acceleration, speed_time)
 
-            # 4. read joint states
-            joints_state = robot_r.getActualQ()
-
-            # 4b. read gripper buttons and control gripper
-            if state.buttons[0]:        # LEFT button → close
+            # gripper: only send on the press transition (cheap, fine every loop)
+            if state.buttons[0] and not prev_buttons[0]:      # LEFT → close
                 set_gripper(gripper, 1.0)
                 gripper_state = 1.0
-            elif state.buttons[1]:      # RIGHT button → open
+            if state.buttons[1] and not prev_buttons[1]:      # RIGHT → open
                 set_gripper(gripper, 0.0)
                 gripper_state = 0.0
-            else:
-                pass  # gripper_state keeps its last value
+            prev_buttons = list(state.buttons[:2])
 
-            # 5. read camera frames
-            frames = read_cameras(cameras)
+            # ---- preview + keys + recording: throttled to RECORD_HZ ----
+            if loop_count % record_every == 0:
+                joints_state = robot_r.getActualQ()
+                frames = cam_reader.read()
+                cv2.imshow("base", cv2.cvtColor(frames["base"], cv2.COLOR_RGB2BGR))
+                cv2.imshow("wrist", cv2.cvtColor(frames["wrist"], cv2.COLOR_RGB2BGR))
+                key = cv2.waitKey(1) & 0xFF
 
-            # show live preview (also required for waitKey to capture keys)
-            cv2.imshow("base", cv2.cvtColor(frames["base"], cv2.COLOR_RGB2BGR))
-            cv2.imshow("wrist",cv2.cvtColor(frames["wrist"], cv2.COLOR_RGB2BGR))
-            key = cv2.waitKey(1) & 0xFF
-
-            
-            if key == ord('s'):
-                if not is_recording:
-                    print(f"Started recording episode {episode_number:04d}.")
-                    is_recording = True
-                else:
-                    path = SAVE_DIR / f"episode_{episode_number:04d}.hdf5"
-                    recorder.save(path, task_instruction) # TODO 11 让用户输入 task_instruction
-                    print(f"Episode saved to {path}.")
-                    episode_number += 1
+                if key == ord('s'):
+                    if not is_recording:
+                        print(f"Started recording episode {episode_number:04d}.")
+                        is_recording = True
+                    else:
+                        path = SAVE_DIR / f"episode_{episode_number:04d}.hdf5"
+                        recorder.save(path, task_instruction)
+                        print(f"Episode saved to {path}.")
+                        episode_number += 1
+                        is_recording = False
+                        recorder.discard()
+                elif key == ord('d'):
+                    recorder.discard()
                     is_recording = False
-                    recorder.discard() # 保存后清空当前记录器，准备下一集
-                    
-            elif key == ord('d'):
-                recorder.discard()
-                is_recording = False
-                print(f"Episode {episode_number:04d} discarded.")
-            elif key == ord('q'):
-                print("Quitting data collection.")
-                break
-           
-            # 6. add frame to recorder
-            if is_recording:
-                recorder.add_frame(joints_state, gripper_state, frames)
+                    print(f"Episode {episode_number:04d} discarded.")
+                elif key == ord('q'):
+                    print("Quitting data collection.")
+                    break
+
+                if is_recording:
+                    recorder.add_frame(joints_state, gripper_state, frames)
+
+            loop_count += 1
+            time.sleep(dt)
 
 
 #11: def main()
@@ -257,12 +318,13 @@ def main():
     print("Robot connected.")
     print("Connecting to cameras...")
     cameras = connect_cameras()
+    cam_reader = CameraReader(cameras).start()   # start background capture thread
     print("Cameras connected.")
     print("Connecting to gripper...")
     gripper = connect_gripper()
     print("All devices ready. Starting collection loop.")
     recorder = EpisodeRecorder()
-    run_collection_loop(robot_control, robot_receive, cameras, gripper, recorder, task_instruction)
+    run_collection_loop(robot_control, robot_receive, cam_reader, gripper, recorder, task_instruction)
 
     try:
         robot_control.speedStop()
@@ -288,6 +350,8 @@ def main():
         gripper.close()
     except Exception as e:
         print(f"gripper disconnect failed: {e}")
+
+    cam_reader.stop()   # stop the background thread before releasing the cameras
 
     for name, cap in cameras.items():
         try:
