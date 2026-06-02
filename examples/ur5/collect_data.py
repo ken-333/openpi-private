@@ -34,7 +34,7 @@ GRIPPER_PORT = 63352
 # Motion control mapping (tuned in teleop_ur5.py)
 AXIS_SIGN = {
     "x": +1, "y": +1, "z": +1,
-    "roll": +2, "pitch": + 2, "yaw": +2,
+    "roll": 0, "pitch": 0, "yaw": +2,
 }
 TRANS_SCALE = 0.1   # translation: m/s at full SpaceMouse deflection
 ROT_SCALE   = 0.1   # rotation:    rad/s at full SpaceMouse deflection
