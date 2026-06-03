@@ -48,14 +48,6 @@ def apply_deadzone(state, threshold):
     return state
 
 
-def apply_dominant_axis(raw):
-    # 只保留绝对值最大的那个轴，其余归零，模拟 3DxWare 主轴锁定
-    idx = np.argmax(np.abs(raw))
-    result = np.zeros(6)
-    result[idx] = raw[idx]
-    return result
-
-
 def map_to_velocity(state):
     raw = np.array([
         AXIS_SIGN["x"]     * state.x,
@@ -68,7 +60,13 @@ def map_to_velocity(state):
     raw = apply_deadzone(raw, SPACEMOUSE_DEADZONE)
     raw[:3] *= TRANS_SCALE
     raw[3:] *= ROT_SCALE
-    raw = apply_dominant_axis(raw)
+    # 旋转轴互斥：roll/pitch/yaw 同一时刻只响应最大的那个，平移不受影响
+    rot = raw[3:]
+    if np.any(rot != 0):
+        dominant = np.argmax(np.abs(rot))
+        mask = np.zeros(3)
+        mask[dominant] = 1.0
+        raw[3:] = rot * mask
     return raw
 
 # 4: def connect_robot(ip)  创建一个到机器人的网络连接，并封装成对象
