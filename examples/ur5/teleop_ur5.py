@@ -25,15 +25,15 @@ CONTROL_HZ = 125
 SPACEMOUSE_DEADZONE = 0.05
 GRIPPER_PORT = 63352   # Robotiq URCap text protocol over socket
 
-# ---- Motion control tuning (this is what you fine-tune) ----------------------
-# speedL expects TCP velocity in the robot BASE frame: [vx, vy, vz, rx, ry, rz]
-# SpaceMouse gives:                                      x,  y,  z,  roll, pitch, yaw
-# Flip a sign (+1/-1) if an axis moves the wrong way; swap the assignments in
-# map_to_velocity() if two axes are interchanged.
-AXIS_SIGN = {
-    "x": +2, "y": +2, "z": +2,
-    "roll": +2, "pitch": +2, "yaw": +2,
-}
+# SpaceMouse → robot base frame coordinate transform
+# Converts SpaceMouse axes to UR5 base frame via rotation matrix (from openpi teleop.py)
+# If an axis moves the wrong way after testing, flip the sign of the corresponding row.
+TX_ZUP_SPNAV = np.array([
+    [0, 0, -1],
+    [1, 0, 0],
+    [0, 1, 0]
+], dtype=np.float32)
+
 TRANS_SCALE = 0.1   # translation: m/s at full SpaceMouse deflection
 ROT_SCALE   = 0.1   # rotation:    rad/s at full SpaceMouse deflection
 
@@ -85,20 +85,14 @@ def set_gripper(gripper, position):
 
 
 def map_to_velocity(state):
-    # TODO(tune): adjust the axis assignments + AXIS_SIGN until the robot
-    #             moves the same way your hand pushes the SpaceMouse.
-    raw = np.array([
-        AXIS_SIGN["x"]     * state.x,
-        AXIS_SIGN["y"]     * state.y,
-        AXIS_SIGN["z"]     * state.z,
-        AXIS_SIGN["roll"]  * state.roll,
-        AXIS_SIGN["pitch"] * state.pitch,
-        AXIS_SIGN["yaw"]   * state.yaw,
-    ])
-    raw = apply_deadzone(raw, SPACEMOUSE_DEADZONE)
-    raw[:3] *= TRANS_SCALE   # translation components
-    raw[3:] *= ROT_SCALE     # rotation components
-    return raw
+    raw_trans = np.array([state.x, state.y, state.z])
+    raw_rot   = np.array([state.roll, state.pitch, state.yaw])
+
+    trans = TX_ZUP_SPNAV @ raw_trans * TRANS_SCALE
+    rot   = TX_ZUP_SPNAV @ raw_rot   * ROT_SCALE
+
+    velocity = np.concatenate([trans, rot])
+    return apply_deadzone(velocity, SPACEMOUSE_DEADZONE)
 
 
 def teleop(robot_c, robot_r, gripper):

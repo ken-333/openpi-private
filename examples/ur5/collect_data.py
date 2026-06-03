@@ -31,11 +31,15 @@ SAVE_DIR = Path("./collected_data")    # directory to save episodes
 SPACEMOUSE_DEADZONE = 0.05             # threshold for noise cancellation
 GRIPPER_PORT = 63352
 
-# Motion control mapping (tuned in teleop_ur5.py)
-AXIS_SIGN = {
-    "x": +0.8, "y": +0.8, "z": +0.8,
-    "roll": +0, "pitch": +0, "yaw": +2,
-}
+# SpaceMouse → robot base frame coordinate transform
+# Converts SpaceMouse axes to UR5 base frame via rotation matrix (from openpi teleop.py)
+# If an axis moves the wrong way after testing, flip the sign of the corresponding row.
+TX_ZUP_SPNAV = np.array([
+    [0, 0, -1],
+    [1, 0, 0],
+    [0, 1, 0]
+], dtype=np.float32)
+
 TRANS_SCALE = 0.1   # translation: m/s at full SpaceMouse deflection
 ROT_SCALE   = 0.1   # rotation:    rad/s at full SpaceMouse deflection
 
@@ -44,23 +48,19 @@ ROT_SCALE   = 0.1   # rotation:    rad/s at full SpaceMouse deflection
 #   输出: 小于阈值的分量清零后的向量
 def apply_deadzone(state, threshold):
     state = np.array(state)
-    state[np.abs(state) < threshold] =0 # 将小于阈值的分量清零
+    state[np.abs(state) < threshold] = 0 # 将小于阈值的分量清零
     return state
 
 
 def map_to_velocity(state):
-    raw = np.array([
-        AXIS_SIGN["x"]     * state.x,
-        AXIS_SIGN["y"]     * state.y,
-        AXIS_SIGN["z"]     * state.z,
-        AXIS_SIGN["roll"]  * state.roll,
-        AXIS_SIGN["pitch"] * state.pitch,
-        AXIS_SIGN["yaw"]   * state.yaw,
-    ])
-    raw = apply_deadzone(raw, SPACEMOUSE_DEADZONE)
-    raw[:3] *= TRANS_SCALE
-    raw[3:] *= ROT_SCALE
-    return raw
+    raw_trans = np.array([state.x, state.y, state.z])
+    raw_rot   = np.array([state.roll, state.pitch, state.yaw])
+
+    trans = TX_ZUP_SPNAV @ raw_trans * TRANS_SCALE
+    rot   = TX_ZUP_SPNAV @ raw_rot   * ROT_SCALE
+
+    velocity = np.concatenate([trans, rot])
+    return apply_deadzone(velocity, SPACEMOUSE_DEADZONE)
 
 # 4: def connect_robot(ip)  创建一个到机器人的网络连接，并封装成对象
 #   创建并返回 rtde_control 和 rtde_receive 两个接口对象
