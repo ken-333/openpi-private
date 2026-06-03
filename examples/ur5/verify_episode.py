@@ -1,12 +1,13 @@
 """
-Verify a collected HDF5 episode.
+Verify all collected HDF5 episodes in a directory.
 
 Usage:
-    python verify_episode.py path/to/episode_0000.hdf5
+    python verify_episode.py [data_dir]      # default data_dir = collected_data
 
-Outputs (into debug_output/ next to the HDF5 file):
-    <name>_video.mp4   — base + wrist side-by-side with frame/joint overlay
-    <name>_joints.png  — joint angle curves over time
+Processes every episode_*.hdf5 in data_dir (sequentially, one ~1GB episode
+in memory at a time) and writes outputs under data_dir/verification/:
+    verification/videos/<episode>.mp4   — base + wrist side-by-side with frame/joint overlay
+    verification/joints/<episode>.png   — joint angle curves over time
 """
 
 import argparse
@@ -17,7 +18,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 JOINT_NAMES = ["Base", "Shoulder", "Elbow", "Wrist1", "Wrist2", "Wrist3", "Gripper"]
-FPS = 30
+FPS = 20
 
 
 def load_episode(path):
@@ -36,8 +37,9 @@ def print_stats(path, qpos, base, task):
     print(f"  Task    : {task}")
     print(f"  Frames  : {n}  ({n / FPS:.1f}s at {FPS}Hz)")
     print(f"  Image   : {w}×{h}")
-    print(f"  qpos min: {np.degrees(qpos.min(axis=0)).round(1)} deg")
-    print(f"  qpos max: {np.degrees(qpos.max(axis=0)).round(1)} deg")
+    print(f"  joints min: {np.degrees(qpos[:, :6].min(axis=0)).round(1)} deg")
+    print(f"  joints max: {np.degrees(qpos[:, :6].max(axis=0)).round(1)} deg")
+    print(f"  gripper   : {qpos[:, 6].min():.2f} – {qpos[:, 6].max():.2f}")
     print()
 
 
@@ -108,22 +110,39 @@ def make_joint_plot(out_path, qpos):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("hdf5", type=Path, help="Path to episode HDF5 file")
+    parser.add_argument("data_dir", type=Path, nargs="?", default=Path("collected_data"),
+                        help="Directory containing episode_*.hdf5 (default: collected_data)")
     args = parser.parse_args()
 
-    path = args.hdf5.resolve()
-    if not path.exists():
-        raise FileNotFoundError(path)
+    data_dir = args.data_dir.resolve()
+    if not data_dir.is_dir():
+        raise NotADirectoryError(data_dir)
 
-    out_dir = path.parent / "debug_output"
-    out_dir.mkdir(exist_ok=True)
-    stem = path.stem
+    episodes = sorted(data_dir.glob("episode_*.hdf5"))
+    if not episodes:
+        raise FileNotFoundError(f"No episode_*.hdf5 files found in {data_dir}")
 
-    qpos, base, wrist, task = load_episode(path)
-    print_stats(path, qpos, base, task)
-    make_video(out_dir / f"{stem}_video.mp4", base, wrist, qpos)
-    make_joint_plot(out_dir / f"{stem}_joints.png", qpos)
-    print("\nDone.")
+    video_dir  = data_dir / "verification" / "videos"
+    joints_dir = data_dir / "verification" / "joints"
+    video_dir.mkdir(parents=True, exist_ok=True)
+    joints_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Found {len(episodes)} episode(s) in {data_dir}")
+    failed = []
+    for path in episodes:
+        stem = path.stem  # e.g. "episode_0000" → keeps episode id in every output filename
+        try:
+            qpos, base, wrist, task = load_episode(path)
+            print_stats(path, qpos, base, task)
+            make_video(video_dir / f"{stem}.mp4", base, wrist, qpos)
+            make_joint_plot(joints_dir / f"{stem}.png", qpos)
+        except Exception as e:
+            print(f"  ERROR processing {path.name}: {e}")
+            failed.append(path.name)
+
+    print(f"\nDone. {len(episodes) - len(failed)}/{len(episodes)} episode(s) succeeded.")
+    if failed:
+        print(f"Failed: {', '.join(failed)}")
 
 
 if __name__ == "__main__":
