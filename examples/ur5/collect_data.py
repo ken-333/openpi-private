@@ -34,7 +34,7 @@ GRIPPER_PORT = 63352
 # Motion control mapping (tuned in teleop_ur5.py)
 AXIS_SIGN = {
     "x": +1, "y": +1, "z": +1,
-    "roll": +0.3, "pitch": +0.3, "yaw": +2,
+    "roll": +0.2, "pitch": +0.2, "yaw": +1,
 }
 TRANS_SCALE = 0.1   # translation: m/s at full SpaceMouse deflection
 ROT_SCALE   = 0.1   # rotation:    rad/s at full SpaceMouse deflection
@@ -46,6 +46,14 @@ def apply_deadzone(state, threshold):
     state = np.array(state)
     state[np.abs(state) < threshold] =0 # 将小于阈值的分量清零
     return state
+
+
+def apply_dominant_axis(raw):
+    # 只保留绝对值最大的那个轴，其余归零，模拟 3DxWare 主轴锁定
+    idx = np.argmax(np.abs(raw))
+    result = np.zeros(6)
+    result[idx] = raw[idx]
+    return result
 
 
 def map_to_velocity(state):
@@ -60,13 +68,7 @@ def map_to_velocity(state):
     raw = apply_deadzone(raw, SPACEMOUSE_DEADZONE)
     raw[:3] *= TRANS_SCALE
     raw[3:] *= ROT_SCALE
-    # 旋转轴互斥：roll/pitch/yaw 同一时刻只响应最大的那个，平移不受影响
-    rot = raw[3:]
-    if np.any(rot != 0):
-        dominant = np.argmax(np.abs(rot))
-        mask = np.zeros(3)
-        mask[dominant] = 1.0
-        raw[3:] = rot * mask
+    raw = apply_dominant_axis(raw)
     return raw
 
 # 4: def connect_robot(ip)  创建一个到机器人的网络连接，并封装成对象
