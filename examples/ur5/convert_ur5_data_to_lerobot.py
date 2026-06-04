@@ -29,7 +29,7 @@ import tqdm
 import tyro
 
 # 6 UR5 joints + gripper, matching the qpos/action column order in collect_data.py
-JOINT_NAMES = ["base", "shoulder", "elbow", "wrist1", "wrist2", "wrist3", "gripper"]
+JOINT_NAMES = ["base", "shoulder", "elbow", "wrist1", "wrist2", "wrist3", "gripper"] # note that the gripper is included as a "joint" here, even though it's not a physical joint of the UR5 arm, because it's part of the action/state space and we want to include it in the dataset features
 CAMERAS = ["base", "wrist"]
 IMAGE_SHAPE = (3, 480, 640)   # CHW, as LeRobot declares image features
 
