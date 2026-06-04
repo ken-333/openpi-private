@@ -11,56 +11,107 @@ Controls:
     Keyboard 'q'     → quit
 """
 
-import pyspacemouse 
-import rtde_control 
+import rtde_control
 import rtde_receive
 import cv2
 import h5py # 用于保存数据的 HDF5 文件格式库，适合存储大量结构化数据，如图像和关节状态等。
 import numpy as np
 import time
 import threading
+import ctypes
+from collections import defaultdict
+from threading import Thread, Event
 from pathlib import Path
 import socket
 import os
+
+# spnav 0.9 (PyPI) is Python-2 only: at import it binds PyCObject_AsVoidPtr
+# (removed in CPython 3.3), used only by the unused X11 path. Stub it for py3.
+try:
+    ctypes.pythonapi.PyCObject_AsVoidPtr
+except AttributeError:
+    class _PyCObjectStub:
+        restype = None
+        argtypes = None
+    ctypes.pythonapi.PyCObject_AsVoidPtr = _PyCObjectStub()
+
+from spnav import (
+    spnav_open, spnav_poll_event, spnav_close,
+    SpnavMotionEvent, SpnavButtonEvent,
+)
 
 
 ROBOT_IP = "192.168.0.101"             # change to your robot's IP
 CONTROL_HZ = 150                       # motion command rate (speedL) — high = smooth
 RECORD_HZ = 30                         # preview + episode recording rate (~camera fps)
 SAVE_DIR = Path("./collected_data")    # directory to save episodes
-SPACEMOUSE_DEADZONE = 0.05             # threshold for noise cancellation
+SPACEMOUSE_DEADZONE = 0.3             # threshold for noise cancellation
 GRIPPER_PORT = 63352
 
-# SpaceMouse → robot base frame coordinate transform
-# Converts SpaceMouse axes to UR5 base frame via rotation matrix (from openpi teleop.py)
-# If an axis moves the wrong way after testing, flip the sign of the corresponding row.
-TX_ZUP_SPNAV = np.array([
-    [0, 0, -1],
-    [1, 0, 0],
-    [0, 1, 0]
-], dtype=np.float32)
-
-TRANS_SCALE = 0.1   # translation: m/s at full SpaceMouse deflection
-ROT_SCALE   = 0.1   # rotation:    rad/s at full SpaceMouse deflection
-
-# 3: def apply_deadzone(state, threshold)
-#   输入: SpaceMouse 原始 6D 向量, 阈值
-#   输出: 小于阈值的分量清零后的向量
-def apply_deadzone(state, threshold):
-    state = np.array(state)
-    state[np.abs(state) < threshold] = 0 # 将小于阈值的分量清零
-    return state
+SCALE_FACTOR = 0.1     # velocity scale (same as teleop_ur5_spnav.py)
+SPNAV_MAX_VALUE = 300  # 300 wired SpaceMouse, 500 wireless
 
 
-def map_to_velocity(state):
-    raw_trans = np.array([state.x, state.y, state.z])
-    raw_rot   = np.array([state.roll, state.pitch, state.yaw])
+class Spacemouse(Thread):
+    """Verbatim from teleop_ur5_spnav.py: threaded spnav reader with the
+    tx_zup_spnav frame transform + constructor deadzone."""
 
-    trans = TX_ZUP_SPNAV @ raw_trans * TRANS_SCALE
-    rot   = TX_ZUP_SPNAV @ raw_rot   * ROT_SCALE
+    def __init__(self, max_value=SPNAV_MAX_VALUE, deadzone=(0, 0, 0, 0, 0, 0), dtype=np.float32):
+        if np.issubdtype(type(deadzone), np.number):
+            deadzone = np.full(6, fill_value=deadzone, dtype=dtype)
+        else:
+            deadzone = np.array(deadzone, dtype=dtype)
+        assert (deadzone >= 0).all()
 
-    velocity = np.concatenate([trans, rot])
-    return apply_deadzone(velocity, SPACEMOUSE_DEADZONE)
+        super().__init__()
+        self.stop_event = Event()
+        self.max_value = max_value
+        self.dtype = dtype
+        self.deadzone = deadzone
+        self.motion_event = SpnavMotionEvent([0, 0, 0], [0, 0, 0], 0)
+        self.button_state = defaultdict(lambda: False)
+        self.tx_zup_spnav = np.array([
+            [0, 0, -1],
+            [1, 0, 0],
+            [0, 1, 0]
+        ], dtype=dtype)
+
+    def get_motion_state(self):
+        me = self.motion_event
+        state = np.array(me.translation + me.rotation,
+            dtype=self.dtype) / self.max_value
+        is_dead = (-self.deadzone < state) & (state < self.deadzone)
+        state[is_dead] = 0
+        return state
+
+    def get_motion_state_transformed(self):
+        state = self.get_motion_state()
+        tf_state = np.zeros_like(state)
+        tf_state[:3] = self.tx_zup_spnav @ state[:3]
+        tf_state[3:] = self.tx_zup_spnav @ state[3:]
+        tf_state = tf_state * SCALE_FACTOR
+        return tf_state
+
+    def is_button_pressed(self, button_id):
+        return self.button_state[button_id]
+
+    def stop(self):
+        self.stop_event.set()
+        self.join()
+
+    def run(self):
+        spnav_open()
+        try:
+            while not self.stop_event.is_set():
+                event = spnav_poll_event()
+                if isinstance(event, SpnavMotionEvent):
+                    self.motion_event = event
+                elif isinstance(event, SpnavButtonEvent):
+                    self.button_state[event.bnum] = event.press
+                else:
+                    time.sleep(1 / 200)
+        finally:
+            spnav_close()
 
 # 4: def connect_robot(ip)  创建一个到机器人的网络连接，并封装成对象
 #   创建并返回 rtde_control 和 rtde_receive 两个接口对象
@@ -112,6 +163,7 @@ class CameraReader:
         self.cameras = cameras              # {"base": cap, "wrist": cap}
         self.lock = threading.Lock()        # protects self.latest (shared buffer)
         self.latest = {}                    # newest RGB frame per camera
+        self.latest_ts = {}                 # capture time (time.time()) per camera
         self.running = False
         self.thread = threading.Thread(target=self._loop, daemon=True)
 
@@ -121,9 +173,11 @@ class CameraReader:
             for name, cap in self.cameras.items():
                 ret, frame = cap.read()                  # blocking, but only HERE
                 if ret:
+                    ts = time.time()                     # stamp at capture, for sync auditing
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     with self.lock:
                         self.latest[name] = rgb
+                        self.latest_ts[name] = ts
 
     def start(self):
         self.running = True
@@ -137,9 +191,9 @@ class CameraReader:
         return self
 
     def read(self):
-        # Instant: hand back the most recent frames (no camera I/O here).
+        # Instant: hand back the most recent frames + their capture times (no camera I/O here).
         with self.lock:
-            return dict(self.latest)
+            return dict(self.latest), dict(self.latest_ts)
 
     def stop(self):
         self.running = False
@@ -190,13 +244,17 @@ class EpisodeRecorder:
         self.joints = []
         self.gripper = []
         self.images = []
-    
-    def add_frame(self, joints, gripper, images):
+        self.timestamps = []   # sample time (joint-read time) per frame, seconds
+        self.image_ages = []   # how stale the camera frames were vs the joint read, seconds
+
+    def add_frame(self, joints, gripper, images, timestamp, image_age):
         self.joints.append(joints)
         self.gripper.append(gripper)
         self.images.append(images)
+        self.timestamps.append(timestamp)
+        self.image_ages.append(image_age)
 
-    
+
     def save(self, path, task):
         if len(self.images) < 2:
             print("Episode too short (need at least 2 frames), discarding.")
@@ -205,9 +263,13 @@ class EpisodeRecorder:
         joints = np.array(self.joints)
         gripper = np.array(self.gripper).reshape(-1,1)
         qpos = np.concatenate([joints, gripper], axis=1) # 将关节状态和夹爪状态合并成一个数组
-        
+
         action = qpos[1:] # 动作序列，等于状态序列向前移动一帧，因为动作是从当前状态到下一状态的变化    训练 config 里有 DeltaActions transform，它会在训练时自动转成 delta
         qpos = qpos[:-1] # 状态序列，去掉最后一帧，因为它没有对应的动作
+
+        # timestamps/ages align with the STATE samples (qpos), so drop the last like qpos
+        timestamps = np.array(self.timestamps)[:-1]
+        image_ages = np.array(self.image_ages)[:-1]
 
         base_images = []
         wrist_images = []
@@ -219,16 +281,20 @@ class EpisodeRecorder:
 
         with h5py.File(path, 'w') as f:
             f.create_dataset('task', data=task) # 创建一个名为 'task' 的数据集，存储任务指令
-            f.create_dataset('action', data=action) 
-            f.create_dataset('observation/qpos', data=qpos) 
-            f.create_dataset('observation/images/base', data = base_images ) 
+            f.create_dataset('action', data=action)
+            f.create_dataset('observation/qpos', data=qpos)
+            f.create_dataset('observation/images/base', data = base_images )
             f.create_dataset('observation/images/wrist', data = wrist_images )
+            f.create_dataset('timestamp', data=timestamps)   # per-frame sample time (s)
+            f.create_dataset('image_age', data=image_ages)   # image-vs-state lag (s)
 
     def discard(self):
         self.joints = []
         self.gripper = []
         self.images = []
-    
+        self.timestamps = []
+        self.image_ages = []
+
     def __len__(self):  #调用 len() 时返回帧数
         return len(self.images) # 以帧数为长度
 
@@ -244,7 +310,9 @@ class EpisodeRecorder:
 #     - 处理键盘/按钮输入 (save / discard / quit)
 #     - 控制频率 (time.sleep)
 def run_collection_loop(robot_c, robot_r, cam_reader, gripper, recorder, task_instruction):
-    with pyspacemouse.open() as device:
+    sm = Spacemouse(deadzone=SPACEMOUSE_DEADZONE)   # threaded spnav reader
+    sm.start()
+    try:
         acceleration = 0.5                  # 加速度 m/s^2 (在 teleop_ur5.py 中调好)
         speed_time = 0.1                    # speedL 持续时间
         dt = 1.0 / CONTROL_HZ               # 控制循环节流
@@ -256,23 +324,24 @@ def run_collection_loop(robot_c, robot_r, cam_reader, gripper, recorder, task_in
         loop_count = 0
         while True:
             # ---- motion path: runs EVERY loop at CONTROL_HZ (keep it lean!) ----
-            state = device.read()
-            velocity = map_to_velocity(state)
+            velocity = sm.get_motion_state_transformed()
             robot_c.speedL(velocity.tolist(), acceleration, speed_time)
 
             # gripper: only send on the press transition (cheap, fine every loop)
-            if state.buttons[0] and not prev_buttons[0]:      # LEFT → close
+            b0, b1 = sm.is_button_pressed(0), sm.is_button_pressed(1)
+            if b0 and not prev_buttons[0]:      # LEFT → close
                 set_gripper(gripper, 1.0)
                 gripper_state = 1.0
-            if state.buttons[1] and not prev_buttons[1]:      # RIGHT → open
+            if b1 and not prev_buttons[1]:      # RIGHT → open
                 set_gripper(gripper, 0.0)
                 gripper_state = 0.0
-            prev_buttons = list(state.buttons[:2])
+            prev_buttons = [b0, b1]
 
             # ---- preview + keys + recording: throttled to RECORD_HZ ----
             if loop_count % record_every == 0:
+                t_sample = time.time()                  # canonical sample time = joint read
                 joints_state = robot_r.getActualQ()
-                frames = cam_reader.read()
+                frames, frame_ts = cam_reader.read()
                 cv2.imshow("base", cv2.cvtColor(frames["base"], cv2.COLOR_RGB2BGR))
                 cv2.imshow("wrist", cv2.cvtColor(frames["wrist"], cv2.COLOR_RGB2BGR))
                 key = cv2.waitKey(1) & 0xFF
@@ -297,10 +366,14 @@ def run_collection_loop(robot_c, robot_r, cam_reader, gripper, recorder, task_in
                     break
 
                 if is_recording:
-                    recorder.add_frame(joints_state, gripper_state, frames)
+                    # image_age = how stale the oldest camera frame was vs the joint read
+                    image_age = t_sample - min(frame_ts.values())
+                    recorder.add_frame(joints_state, gripper_state, frames, t_sample, image_age)
 
             loop_count += 1
             time.sleep(dt)
+    finally:
+        sm.stop()
 
 
 #11: def main()

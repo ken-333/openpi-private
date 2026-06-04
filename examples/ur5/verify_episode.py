@@ -27,29 +27,70 @@ def load_episode(path):
         base   = f["observation/images/base"][:]  # (N, H, W, 3) RGB
         wrist  = f["observation/images/wrist"][:] # (N, H, W, 3) RGB
         task   = f["task"][()].decode() if isinstance(f["task"][()], bytes) else str(f["task"][()])
-    return qpos, base, wrist, task
+        # timestamp/image_age only exist in episodes recorded after the timing patch
+        timestamps = f["timestamp"][:] if "timestamp" in f else None
+        image_ages = f["image_age"][:] if "image_age" in f else None
+    return qpos, base, wrist, task, timestamps, image_ages
 
 
-def print_stats(path, qpos, base, task):
+def effective_fps(timestamps):
+    """Real frame rate from recorded timestamps; falls back to FPS for old episodes."""
+    if timestamps is not None and len(timestamps) > 1:
+        mean_dt = np.diff(timestamps).mean()
+        if mean_dt > 0:
+            return 1.0 / mean_dt
+    return FPS
+
+
+def time_axis(qpos, timestamps):
+    """Seconds-from-start for each frame (real timestamps if present, else uniform FPS)."""
+    if timestamps is not None and len(timestamps) > 1:
+        return timestamps - timestamps[0]
+    return np.arange(len(qpos)) / FPS
+
+
+def timing_report(timestamps, image_ages):
+    """Print rate / jitter / image-vs-state lag so you can judge temporal quality."""
+    if timestamps is None or len(timestamps) < 2:
+        print("  timing  : no timestamps (episode recorded before timing patch)")
+        return
+    dt = np.diff(timestamps)
+    rate = 1.0 / dt.mean()
+    print(f"  rate    : {rate:5.1f} Hz   dt mean {dt.mean()*1e3:5.1f} ms"
+          f"  std {dt.std()*1e3:4.1f} ms  max {dt.max()*1e3:5.1f} ms")
+    if dt.std() > 0.5 * dt.mean():
+        print("  ⚠ high timing jitter — frame spacing is uneven (loop stalls?)")
+    if image_ages is not None and len(image_ages):
+        print(f"  img lag : mean {image_ages.mean()*1e3:5.1f} ms  max {image_ages.max()*1e3:5.1f} ms"
+              f"  (camera frame age vs joint read)")
+        if image_ages.max() > 2 * dt.mean():
+            print("  ⚠ image lag exceeds 2 frame intervals — image/state may be misaligned")
+
+
+def print_stats(path, qpos, base, task, timestamps, image_ages):
     n = len(qpos)
     h, w = base.shape[1:3]
+    fps = effective_fps(timestamps)
+    t = time_axis(qpos, timestamps)
+    src = "measured" if timestamps is not None else f"assumed {FPS}Hz"
     print(f"\n--- Episode: {path.name} ---")
     print(f"  Task    : {task}")
-    print(f"  Frames  : {n}  ({n / FPS:.1f}s at {FPS}Hz)")
+    print(f"  Frames  : {n}  ({t[-1]:.1f}s, {fps:.1f}Hz {src})")
     print(f"  Image   : {w}×{h}")
     print(f"  joints min: {np.degrees(qpos[:, :6].min(axis=0)).round(1)} deg")
     print(f"  joints max: {np.degrees(qpos[:, :6].max(axis=0)).round(1)} deg")
     print(f"  gripper   : {qpos[:, 6].min():.2f} – {qpos[:, 6].max():.2f}")
+    timing_report(timestamps, image_ages)
     print()
 
 
-def make_video(out_path, base_imgs, wrist_imgs, qpos):
+def make_video(out_path, base_imgs, wrist_imgs, qpos, fps):
     n, h, w, _ = base_imgs.shape
     frame_w = w * 2   # side by side
     writer = cv2.VideoWriter(
         str(out_path),
         cv2.VideoWriter_fourcc(*"mp4v"),
-        FPS,
+        fps,   # real recording rate → video plays at true speed
         (frame_w, h),
     )
 
@@ -80,10 +121,7 @@ def make_video(out_path, base_imgs, wrist_imgs, qpos):
     print(f"  Video   → {out_path}")
 
 
-def make_joint_plot(out_path, qpos):
-    n = len(qpos)
-    t = np.arange(n) / FPS
-
+def make_joint_plot(out_path, qpos, t):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
     fig.suptitle(out_path.stem.replace("_joints", ""))
 
@@ -132,10 +170,10 @@ def main():
     for path in episodes:
         stem = path.stem  # e.g. "episode_0000" → keeps episode id in every output filename
         try:
-            qpos, base, wrist, task = load_episode(path)
-            print_stats(path, qpos, base, task)
-            make_video(video_dir / f"{stem}.mp4", base, wrist, qpos)
-            make_joint_plot(joints_dir / f"{stem}.png", qpos)
+            qpos, base, wrist, task, timestamps, image_ages = load_episode(path)
+            print_stats(path, qpos, base, task, timestamps, image_ages)
+            make_video(video_dir / f"{stem}.mp4", base, wrist, qpos, effective_fps(timestamps))
+            make_joint_plot(joints_dir / f"{stem}.png", qpos, time_axis(qpos, timestamps))
         except Exception as e:
             print(f"  ERROR processing {path.name}: {e}")
             failed.append(path.name)
