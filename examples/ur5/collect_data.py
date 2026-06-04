@@ -43,7 +43,7 @@ from spnav import (
 
 ROBOT_IP = "192.168.0.101"             # change to your robot's IP
 CONTROL_HZ = 150                       # motion command rate (speedL) — high = smooth
-RECORD_HZ = 30                         # preview + episode recording rate (~camera fps)
+RECORD_HZ = 25                         # preview + episode recording rate (matches achievable loop rate)
 SAVE_DIR = Path("./collected_data")    # directory to save episodes
 SPACEMOUSE_DEADZONE = 0.3             # threshold for noise cancellation
 GRIPPER_PORT = 63352
