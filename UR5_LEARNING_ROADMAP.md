@@ -215,8 +215,8 @@ Robot client 需要实现 `Environment` 接口（参考 `examples/droid/main.py`
 
 - [ ] Step 1：写 collect_data.py
 - [ ] Step 2：写 convert_ur5_to_lerobot.py
-- [ ] Step 3：写 ur5_policy.py
-- [ ] Step 4：加 TrainConfig
+- [x] Step 3：写 ur5_policy.py
+- [x] Step 4：加 TrainConfig
 - [ ] Step 5：训练并监控 loss
 - [ ] Step 6：真机部署
 - [ ] 清理：删除 laptop 上临时安装的库（pyspacemouse, opencv-python, h5py, numpy）windows系统的laptop装了（远程写代码用）  linux省略这一步
