@@ -57,7 +57,7 @@ CONTROL_HZ = 125
 GRIPPER_PORT = 63352        # Robotiq URCap text protocol over socket
 SCALE_FACTOR = 0.1          # velocity scale (same as teleop.py)
 ACCELERATION = 0.5          # m/s^2
-SPACEMOUSE_DEADZONE = 0.2   # normalized [0,1]; below this an axis stays at 0
+SPACEMOUSE_DEADZONE = 0.3   # normalized [0,1]; below this an axis stays at 0
 SPNAV_MAX_VALUE = 300       # 300 wired SpaceMouse, 500 wireless
 PRINT_EVERY = 50            # throttle TCP-velocity prints
 
@@ -113,13 +113,6 @@ class Spacemouse(Thread):
     def stop(self):
         self.stop_event.set()
         self.join()
-
-    def __enter__(self):
-        self.start()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.stop()
 
     def run(self):
         spnav_open()
@@ -195,8 +188,8 @@ def teleop(robot_c, robot_r, gripper, sm):
         prev_buttons = [b0, b1]
 
         if loop_count % PRINT_EVERY == 0:
-            cmd = [round(v, 3) for v in velocity]
-            print(f"cmd: {cmd}")
+            vx, vy, vz, rx, ry, rz = velocity
+            print(f"cmd  trans[{vx:+.3f} {vy:+.3f} {vz:+.3f}]  rot[{rx:+.3f} {ry:+.3f} {rz:+.3f}]")
 
         loop_count += 1
         time.sleep(dt)
