@@ -21,7 +21,7 @@ import shutil
 from typing import Literal
 
 import h5py
-from lerobot.common.datasets.lerobot_dataset import LEROBOT_HOME
+from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME as LEROBOT_HOME
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 import numpy as np
 import torch
@@ -80,7 +80,7 @@ def create_empty_dataset(
         fps=fps,
         robot_type=robot_type,
         features=features,
-        use_videos=dataset_config.use_videos,
+        use_videos=(mode == "video"),   # image mode → store frames directly (no video codec)
         tolerance_s=dataset_config.tolerance_s,
         image_writer_processes=dataset_config.image_writer_processes,
         image_writer_threads=dataset_config.image_writer_threads,
@@ -116,13 +116,13 @@ def populate_dataset(
             frame = {
                 "observation.state": state[i],
                 "action": action[i],
+                "task": task,   # language instruction — per-frame in this lerobot API
             }
             for cam, imgs in imgs_per_cam.items():
                 frame[f"observation.images.{cam}"] = imgs[i]   # HWC uint8 RGB
             dataset.add_frame(frame)
 
-        # each episode carries its own language instruction
-        dataset.save_episode(task=task)
+        dataset.save_episode()
 
     return dataset
 
@@ -146,7 +146,6 @@ def convert_ur5(
 
     dataset = create_empty_dataset(repo_id, fps=fps, mode=mode, dataset_config=dataset_config)
     dataset = populate_dataset(dataset, hdf5_files, episodes=episodes)
-    dataset.consolidate()
 
     if push_to_hub:
         dataset.push_to_hub()
