@@ -2,12 +2,16 @@
 SpaceMouse + UR5 data collection script.
 Task: pick and place with language conditioning.
 
+Usage:
+    python collect_data.py <task_queue.json>
+
 Controls:
     SpaceMouse axes  → UR5 TCP velocity
     Button LEFT      → gripper close
     Button RIGHT     → gripper open
-    Keyboard 's'     → save episode
-    Keyboard 'd'     → discard episode
+    Keyboard 's'     → start / stop recording
+    Keyboard 'y'     → (REVIEW) save episode
+    Keyboard 'n'     → (REVIEW) discard episode
     Keyboard 'q'     → quit
 """
 
@@ -24,6 +28,9 @@ from threading import Thread, Event
 from pathlib import Path
 import socket
 import os
+import json
+import sys
+from datetime import datetime
 
 # spnav 0.9 (PyPI) is Python-2 only: at import it binds PyCObject_AsVoidPtr
 # (removed in CPython 3.3), used only by the unused X11 path. Stub it for py3.
@@ -259,7 +266,7 @@ class EpisodeRecorder:
         if len(self.images) < 2:
             print("Episode too short (need at least 2 frames), discarding.")
             self.discard()
-            return
+            return False
         joints = np.array(self.joints)
         gripper = np.array(self.gripper).reshape(-1,1)
         qpos = np.concatenate([joints, gripper], axis=1) # 将关节状态和夹爪状态合并成一个数组
@@ -287,6 +294,7 @@ class EpisodeRecorder:
             f.create_dataset('observation/images/wrist', data = wrist_images )
             f.create_dataset('timestamp', data=timestamps)   # per-frame sample time (s)
             f.create_dataset('image_age', data=image_ages)   # image-vs-state lag (s)
+        return True
 
     def discard(self):
         self.joints = []
@@ -297,6 +305,89 @@ class EpisodeRecorder:
 
     def __len__(self):  #调用 len() 时返回帧数
         return len(self.images) # 以帧数为长度
+
+
+def load_task_queue(json_path):
+    with open(json_path) as f:
+        data = json.load(f)
+    return data["session_name"], data["tasks"], data.get("sampling_strategy", "sequential")
+
+
+def scan_existing_episodes(save_dir, tasks):
+    prompt_to_idx = {t["prompt"]: i for i, t in enumerate(tasks)}
+    task_counts = {i: 0 for i in range(len(tasks))}
+    next_episode_id = 0
+    files = sorted(Path(save_dir).glob("episode_*.hdf5"))
+    for f in files:
+        ep_num = int(f.stem.split("_")[1])
+        next_episode_id = max(next_episode_id, ep_num + 1)
+        with h5py.File(f, "r") as hf:
+            raw = hf["task"][()]
+            prompt = raw.decode() if isinstance(raw, bytes) else str(raw)
+        if prompt in prompt_to_idx:
+            task_counts[prompt_to_idx[prompt]] += 1
+    return task_counts, next_episode_id
+
+
+def load_progress(save_dir, tasks):
+    manifest_path = Path(save_dir) / "manifest.json"
+    if manifest_path.exists():
+        try:
+            with open(manifest_path) as f:
+                entries = json.load(f)
+            task_counts = {i: 0 for i in range(len(tasks))}
+            manifest_next_id = 0
+            for entry in entries:
+                if entry.get("status") == "saved":
+                    idx = entry["task_index"]
+                    if idx in task_counts:
+                        task_counts[idx] += 1
+                    ep_num = int(entry["episode_id"].split("_")[1])
+                    manifest_next_id = max(manifest_next_id, ep_num + 1)
+            # cross-check: 以磁盘实际 HDF5 文件的最大编号为准，防止崩溃后覆盖已有文件
+            _, hdf5_next_id = scan_existing_episodes(save_dir, tasks)
+            next_episode_id = max(manifest_next_id, hdf5_next_id)
+            if next_episode_id > manifest_next_id:
+                print(f"Warning: HDF5 files beyond manifest detected up to "
+                      f"episode_{next_episode_id - 1:04d}. Those IDs will be skipped.")
+            return task_counts, next_episode_id
+        except Exception:
+            print("Manifest damaged, rebuilding from HDF5 files...")
+    else:
+        print("No manifest found, scanning existing episodes...")
+    return scan_existing_episodes(save_dir, tasks)
+
+
+def write_manifest_entry(save_dir, entry):
+    manifest_path = Path(save_dir) / "manifest.json"
+    entries = []
+    if manifest_path.exists():
+        with open(manifest_path) as f:
+            entries = json.load(f)
+    entries.append(entry)
+    with open(manifest_path, "w") as f:
+        json.dump(entries, f, indent=2)
+
+
+def overlay_info(frame_bgr, state, prompt, task_count, target, episode_id):
+    frame = frame_bgr.copy()
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    color = {"IDLE": (200, 200, 200), "RECORDING": (0, 0, 255), "REVIEW": (0, 165, 255)}.get(state, (255, 255, 255))
+    hint = {"IDLE": "S: start", "RECORDING": "S: stop", "REVIEW": "Y: save  N: discard"}.get(state, "")
+    lines = [
+        prompt[:55] + ("..." if len(prompt) > 55 else ""),
+        f"Progress: {task_count} / {target}   Episode: {episode_id:04d}   [{state}]",
+        hint,
+    ]
+    if state == "REVIEW":
+        lines.append("Save this episode? [Y/N]")
+    y = 28
+    for line in lines:
+        cv2.putText(frame, line, (10, y), font, 0.6, (0, 0, 0), 3)
+        cv2.putText(frame, line, (10, y), font, 0.6, color, 1)
+        y += 28
+    return frame
+
 
 # 10: def run_collection_loop(robot_c, robot_r, cameras, recorder)
 #   主循环:
@@ -309,64 +400,136 @@ class EpisodeRecorder:
 #     - recorder.add_frame(...)
 #     - 处理键盘/按钮输入 (save / discard / quit)
 #     - 控制频率 (time.sleep)
-def run_collection_loop(robot_c, robot_r, cam_reader, gripper, recorder, task_instruction):
-    sm = Spacemouse(deadzone=SPACEMOUSE_DEADZONE)   # threaded spnav reader
+def run_collection_loop(robot_c, robot_r, cam_reader, gripper, recorder, tasks, task_counts, next_episode_id, save_dir, sampling_strategy="sequential"):
+    sm = Spacemouse(deadzone=SPACEMOUSE_DEADZONE)
     sm.start()
     try:
-        acceleration = 0.5                  # 加速度 m/s^2 (在 teleop_ur5.py 中调好)
-        speed_time = 0.1                    # speedL 持续时间
-        dt = 1.0 / CONTROL_HZ               # 控制循环节流
-        record_every = max(1, round(CONTROL_HZ / RECORD_HZ))  # 每 N 圈记录/预览一次
-        episode_number = 0
-        is_recording = False
-        gripper_state = 0.0
-        prev_buttons = [False, False]   # edge detection: fire gripper once per press
-        loop_count = 0
-        while True:
-            # ---- motion path: runs EVERY loop at CONTROL_HZ (keep it lean!) ----
-            velocity = sm.get_motion_state_transformed()
-            robot_c.speedL(velocity.tolist(), acceleration, speed_time)
+        acceleration = 0.5
+        speed_time = 0.1
+        dt = 1.0 / CONTROL_HZ
+        record_every = max(1, round(CONTROL_HZ / RECORD_HZ))
 
-            # gripper: only send on the press transition (cheap, fine every loop)
+        state = "IDLE"
+        current_task_idx = 0
+        episode_id = next_episode_id
+        t_record_start = 0.0
+
+        # skip already-complete tasks on startup
+        while current_task_idx < len(tasks) and \
+              task_counts.get(current_task_idx, 0) >= tasks[current_task_idx]["target_episodes"]:
+            current_task_idx += 1
+        if current_task_idx >= len(tasks):
+            print("All tasks complete!")
+            return
+
+        task = tasks[current_task_idx]
+        print(f"\nCurrent task [{current_task_idx}]: {task['prompt']}")
+        print(f"Progress: {task_counts.get(current_task_idx, 0)} / {task['target_episodes']}")
+        print("Press S to start recording, Q to quit.\n")
+
+        gripper_state = 0.0
+        prev_buttons = [False, False]
+        loop_count = 0
+
+        while True:
+            # motion path: skip speedL during REVIEW to hold robot still
+            if state != "REVIEW":
+                velocity = sm.get_motion_state_transformed()
+                robot_c.speedL(velocity.tolist(), acceleration, speed_time)
+
             b0, b1 = sm.is_button_pressed(0), sm.is_button_pressed(1)
-            if b0 and not prev_buttons[0]:      # LEFT → close
-                set_gripper(gripper, 1.0)
-                gripper_state = 1.0
-            if b1 and not prev_buttons[1]:      # RIGHT → open
-                set_gripper(gripper, 0.0)
-                gripper_state = 0.0
+            if state != "REVIEW":
+                if b0 and not prev_buttons[0]:
+                    set_gripper(gripper, 1.0)
+                    gripper_state = 1.0
+                if b1 and not prev_buttons[1]:
+                    set_gripper(gripper, 0.0)
+                    gripper_state = 0.0
             prev_buttons = [b0, b1]
 
-            # ---- preview + keys + recording: throttled to RECORD_HZ ----
             if loop_count % record_every == 0:
-                t_sample = time.time()                  # canonical sample time = joint read
+                t_sample = time.time()
                 joints_state = robot_r.getActualQ()
                 frames, frame_ts = cam_reader.read()
-                cv2.imshow("base", cv2.cvtColor(frames["base"], cv2.COLOR_RGB2BGR))
-                cv2.imshow("wrist", cv2.cvtColor(frames["wrist"], cv2.COLOR_RGB2BGR))
+
+                base_bgr = cv2.cvtColor(frames["base"], cv2.COLOR_RGB2BGR)
+                wrist_bgr = cv2.cvtColor(frames["wrist"], cv2.COLOR_RGB2BGR)
+                cv2.imshow("base", overlay_info(base_bgr, state, task["prompt"],
+                                                task_counts.get(current_task_idx, 0),
+                                                task["target_episodes"], episode_id))
+                cv2.imshow("wrist", overlay_info(wrist_bgr, state, task["prompt"],
+                                                 task_counts.get(current_task_idx, 0),
+                                                 task["target_episodes"], episode_id))
                 key = cv2.waitKey(1) & 0xFF
 
-                if key == ord('s'):
-                    if not is_recording:
-                        print(f"Started recording episode {episode_number:04d}.")
-                        is_recording = True
-                    else:
-                        path = SAVE_DIR / f"episode_{episode_number:04d}.hdf5"
-                        recorder.save(path, task_instruction)
-                        print(f"Episode saved to {path}.")
-                        episode_number += 1
-                        is_recording = False
-                        recorder.discard()
-                elif key == ord('d'):
-                    recorder.discard()
-                    is_recording = False
-                    print(f"Episode {episode_number:04d} discarded.")
-                elif key == ord('q'):
+                if key == ord('q'):
                     print("Quitting data collection.")
                     break
+                elif state == "IDLE":
+                    if key == ord('s'):
+                        state = "RECORDING"
+                        t_record_start = time.time()
+                        print(f"Recording episode {episode_id:04d} | {task['prompt']}")
+                elif state == "RECORDING":
+                    if key == ord('s'):
+                        state = "REVIEW"
+                        robot_c.speedStop()
+                        print(f"\nSave this episode? [Y/N]  ({len(recorder)} frames)")
+                elif state == "REVIEW":
+                    if key == ord('y'):
+                        path = save_dir / f"episode_{episode_id:04d}.hdf5"
+                        num_frames = max(0, len(recorder) - 1)
+                        duration = time.time() - t_record_start
+                        if not recorder.save(path, task["prompt"]):
+                            state = "IDLE"
+                            continue
+                        write_manifest_entry(save_dir, {
+                            "episode_id": f"episode_{episode_id:04d}",
+                            "task_index": current_task_idx,
+                            "prompt": task["prompt"],
+                            "object": task.get("object", ""),
+                            "plate_color": task.get("plate_color", ""),
+                            "num_frames": num_frames,
+                            "duration_s": round(duration, 2),
+                            "saved_at": datetime.now().isoformat(),
+                            "status": "saved",
+                        })
+                        task_counts[current_task_idx] = task_counts.get(current_task_idx, 0) + 1
+                        episode_id += 1
+                        recorder.discard()
+                        print(f"Saved → episode_{episode_id - 1:04d}.hdf5  "
+                              f"({task_counts[current_task_idx]} / {task['target_episodes']})")
 
-                if is_recording:
-                    # image_age = how stale the oldest camera frame was vs the joint read
+                        # advance to next incomplete task
+                        n = len(tasks)
+                        if sampling_strategy == "round_robin":
+                            next_idx = (current_task_idx + 1) % n
+                            for _ in range(n):
+                                if task_counts.get(next_idx, 0) < tasks[next_idx]["target_episodes"]:
+                                    break
+                                next_idx = (next_idx + 1) % n
+                            else:
+                                print("\nAll tasks complete!")
+                                break
+                            current_task_idx = next_idx
+                        else:
+                            while current_task_idx < n and \
+                                  task_counts.get(current_task_idx, 0) >= tasks[current_task_idx]["target_episodes"]:
+                                current_task_idx += 1
+                            if current_task_idx >= n:
+                                print("\nAll tasks complete!")
+                                break
+
+                        task = tasks[current_task_idx]
+                        print(f"\nNext task [{current_task_idx}]: {task['prompt']}")
+                        print(f"Progress: {task_counts.get(current_task_idx, 0)} / {task['target_episodes']}")
+                        state = "IDLE"
+                    elif key == ord('n'):
+                        recorder.discard()
+                        print("Episode discarded. Retrying current task.")
+                        state = "IDLE"
+
+                if state == "RECORDING":
                     image_age = t_sample - min(frame_ts.values())
                     recorder.add_frame(joints_state, gripper_state, frames, t_sample, image_age)
 
@@ -376,61 +539,73 @@ def run_collection_loop(robot_c, robot_r, cam_reader, gripper, recorder, task_in
         sm.stop()
 
 
-#11: def main()
-#   - 创建 SAVE_DIR
-#   - 让用户输入 task_instruction (input())
-#   - connect_robot, connect_cameras, connect_gripper
-#   - 创建 EpisodeRecorder
-#   - 调用 run_collection_loop
-#   - 断开连接
 def main():
+    if len(sys.argv) < 2: # 检查是否提供了命令行参数，如果没有，则打印使用说明并退出程序。
+        print("Usage: python collect_data.py <task_queue.json>")
+        sys.exit(1)
+
+    json_path = sys.argv[1]  # 从命令行参数获取任务队列的 JSON 文件路径
+    session_name, tasks, sampling_strategy = load_task_queue(json_path)
     os.makedirs(SAVE_DIR, exist_ok=True) 
-    task_instruction = input("Enter task instruction for this episode: ")
-    print("Connecting to robot...")
-    robot_control, robot_receive = connect_robot(ROBOT_IP)
-    print("Robot connected.")
-    print("Connecting to cameras...")
-    cameras = connect_cameras()
-    cam_reader = CameraReader(cameras).start()   # start background capture thread
-    print("Cameras connected.")
-    print("Connecting to gripper...")
-    gripper = connect_gripper()
-    print("All devices ready. Starting collection loop.")
-    recorder = EpisodeRecorder()
-    run_collection_loop(robot_control, robot_receive, cam_reader, gripper, recorder, task_instruction)
+    task_counts, next_episode_id = load_progress(SAVE_DIR, tasks)
 
+    print(f"\nSession: {session_name}")
+    for i, t in enumerate(tasks): # 打印每个任务的进度，显示已完成的 episode 数量和目标 episode 数量
+        count = task_counts.get(i, 0)
+        status = "DONE" if count >= t["target_episodes"] else f"{count}/{t['target_episodes']}" 
+        print(f"  [{i}] {t['prompt']}  —  {status}") # 显示任务索引、提示语和完成状态（DONE 或 进度计数）
+
+    if all(task_counts.get(i, 0) >= t["target_episodes"] for i, t in enumerate(tasks)):
+        print("\nAll tasks complete. Nothing to collect.")
+        return
+
+    robot_control = robot_receive = cameras = cam_reader = gripper = None
     try:
-        robot_control.speedStop()
-    except Exception as e:
-        print(f"speedStop failed: {e}")
-
-    try:
-        robot_control.stopScript()  # 停止机器人当前的运动脚本，确保它不再执行任何命令
-    except Exception as e:
-        print(f"stopScript failed: {e}")
-
-    try:
-        robot_control.disconnect()
-    except Exception as e:
-        print(f"control disconnect failed: {e}")
-
-    try:
-        robot_receive.disconnect()
-    except Exception as e:
-        print(f"receive disconnect failed: {e}")
-
-    try:
-        gripper.close()
-    except Exception as e:
-        print(f"gripper disconnect failed: {e}")
-
-    cam_reader.stop()   # stop the background thread before releasing the cameras
-
-    for name, cap in cameras.items():
-        try:
-            cap.release()
-        except Exception as e:
-            print(f"camera {name} release failed: {e}")
+        print("\nConnecting to robot...")
+        robot_control, robot_receive = connect_robot(ROBOT_IP)
+        print("Robot connected.")
+        print("Connecting to cameras...")
+        cameras = connect_cameras()
+        cam_reader = CameraReader(cameras).start()
+        print("Cameras connected.")
+        print("Connecting to gripper...")
+        gripper = connect_gripper()
+        print("All devices ready. Starting collection loop.")
+        recorder = EpisodeRecorder()
+        run_collection_loop(robot_control, robot_receive, cam_reader, gripper, recorder,
+                            tasks, task_counts, next_episode_id, SAVE_DIR, sampling_strategy)
+    finally:
+        if robot_control is not None:
+            try:
+                robot_control.speedStop()
+            except Exception as e:
+                print(f"speedStop failed: {e}")
+            try:
+                robot_control.stopScript()
+            except Exception as e:
+                print(f"stopScript failed: {e}")
+            try:
+                robot_control.disconnect()
+            except Exception as e:
+                print(f"control disconnect failed: {e}")
+        if robot_receive is not None:
+            try:
+                robot_receive.disconnect()
+            except Exception as e:
+                print(f"receive disconnect failed: {e}")
+        if gripper is not None:
+            try:
+                gripper.close()
+            except Exception as e:
+                print(f"gripper disconnect failed: {e}")
+        if cam_reader is not None:
+            cam_reader.stop()
+        if cameras is not None:
+            for name, cap in cameras.items():
+                try:
+                    cap.release()
+                except Exception as e:
+                    print(f"camera {name} release failed: {e}")
             
     cv2.destroyAllWindows()
 

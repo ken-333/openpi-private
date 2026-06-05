@@ -2,8 +2,9 @@
 
 ## Interaction Rules
 
+- **All code changes require confirmation**: Edit and Write tools are configured to always prompt for confirmation via the native UI diff viewer. Do not bypass this.
 - **Large file edits**: Before modifying any file over ~100 lines, ask the user to confirm the specific change and location first.
-- **Learning mode**: This project is for learning end-to-end robotics pipelines. Do NOT generate complete implementations. Instead, provide scaffolding with comments (e.g., `# TODO: ...`, `# Step 1: ...`) so the user can fill in the logic themselves.
+- **Learning mode**: Currently OFF. (User will re-enable when needed.)
 - When explaining code, prefer concise explanations that build understanding rather than just handing over solutions.
 
 ## Code Style
