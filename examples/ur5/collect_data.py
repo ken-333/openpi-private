@@ -21,6 +21,7 @@ import cv2
 import h5py # 用于保存数据的 HDF5 文件格式库，适合存储大量结构化数据，如图像和关节状态等。
 import numpy as np
 import time
+import math
 import threading
 import ctypes
 from collections import defaultdict
@@ -47,6 +48,9 @@ from spnav import (
     SpnavMotionEvent, SpnavButtonEvent,
 )
 
+# Reuse the canonical home pose from go_home.py (single source of truth).
+from go_home import HOME_JOINTS_DEG
+
 
 ROBOT_IP = "192.168.0.101"             # change to your robot's IP
 CONTROL_HZ = 150                       # motion command rate (speedL) — high = smooth
@@ -57,6 +61,10 @@ GRIPPER_PORT = 63352
 
 SCALE_FACTOR = 0.1     # velocity scale (same as teleop_ur5_spnav.py)
 SPNAV_MAX_VALUE = 300  # 300 wired SpaceMouse, 500 wireless
+
+# Post-save homing: slower than go_home.py (0.5/0.3) for safety during collection
+HOME_SPEED = 0.3   # rad/s
+HOME_ACCEL = 0.2   # rad/s²
 
 
 class Spacemouse(Thread):
@@ -134,7 +142,7 @@ def connect_robot(ip):
 def connect_cameras():
     camera = {
         "base": cv2.VideoCapture(22),   # RealSense color stream (YUYV)
-        "wrist": cv2.VideoCapture(10)  # RealSense color stream (YUYV)
+        "wrist": cv2.VideoCapture(4)  # RealSense color stream (YUYV)
     }                                  #为何用dict？因为有两个摄像头，使用dict可以更清晰地管理它们，并通过键名访问对应的摄像头对象。
     for cap in camera.values():
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep only newest frame → less lag
@@ -389,6 +397,16 @@ def overlay_info(frame_bgr, state, prompt, task_count, target, episode_id):
     return frame
 
 
+def move_home(robot_c):
+    print("Moving robot to home...")
+    try:
+        home_rad = [math.radians(j) for j in HOME_JOINTS_DEG]
+        robot_c.moveJ(home_rad, HOME_SPEED, HOME_ACCEL)
+        print("Finished moving home.")
+    except Exception as e:
+        print(f"Home move failed: {e}")
+
+
 # 10: def run_collection_loop(robot_c, robot_r, cameras, recorder)
 #   主循环:
 #     - 读 SpaceMouse
@@ -500,6 +518,9 @@ def run_collection_loop(robot_c, robot_r, cam_reader, gripper, recorder, tasks, 
                         print(f"Saved → episode_{episode_id - 1:04d}.hdf5  "
                               f"({task_counts[current_task_idx]} / {task['target_episodes']})")
 
+                        # return to fixed home pose so objects can be re-staged
+                        move_home(robot_c)
+
                         # advance to next incomplete task
                         n = len(tasks)
                         if sampling_strategy == "round_robin":
@@ -526,7 +547,9 @@ def run_collection_loop(robot_c, robot_r, cam_reader, gripper, recorder, tasks, 
                         state = "IDLE"
                     elif key == ord('n'):
                         recorder.discard()
-                        print("Episode discarded. Retrying current task.")
+                        print("Episode discarded.")
+                        move_home(robot_c)
+                        print("Retrying current task.")
                         state = "IDLE"
 
                 if state == "RECORDING":
