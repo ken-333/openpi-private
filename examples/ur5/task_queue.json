@@ -1,0 +1,18 @@
+{
+  "session_name": "banana_tomato_pick_place_v1",
+  "sampling_strategy": "round_robin",
+  "tasks": [
+    {
+      "object": "banana",
+      "plate_color": "blue",
+      "target_episodes": 50,
+      "prompt": "pick up the banana and place it in the blue plate"
+    },
+    {
+      "object": "tomato",
+      "plate_color": "red",
+      "target_episodes": 50,
+      "prompt": "pick up the tomato and place it in the red plate"
+    }
+  ]
+}
