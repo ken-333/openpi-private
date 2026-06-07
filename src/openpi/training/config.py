@@ -1034,7 +1034,8 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotUR5DataConfig(
-            repo_id="ur5/pick_place",
+            repo_id="shoukangyu/ur5_pick_place_v1",
+            assets=AssetsConfig(asset_id="ur5/pick_place"),
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
