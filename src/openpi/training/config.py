@@ -364,6 +364,9 @@ class LeRobotUR5DataConfig(DataConfigFactory):
     conversion (our recorded actions are absolute joint targets).
     """
 
+    # Action key used by the LeRobot dataset before repacking.
+    action_sequence_keys: Sequence[str] = ("action",)
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         # Remap the LeRobot feature names (from convert_ur5_data_to_lerobot.py) to the keys
@@ -403,6 +406,7 @@ class LeRobotUR5DataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
