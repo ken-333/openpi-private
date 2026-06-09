@@ -177,6 +177,26 @@ action = actions[0]
 # TODO: send a small, low-speed command to the robot.
 ```
 
+Use the one-step runner first:
+
+```bash
+cd /home/kenn/Desktop/openpi-private
+source .venv/bin/activate
+
+PYTHONPATH=src python examples/ur5/run_ur5_policy_step.py \
+  --host 100.112.30.96 \
+  --prompt "pick up the banana and place it in the blue plate" \
+  --gripper-position 0.0 \
+  --steps 1 \
+  --max-joint-delta 0.03 \
+  --speed 0.08 \
+  --accel 0.08
+```
+
+This script waits for Enter before executing each step. Type `q` then Enter to stop without moving.
+
+Do not move to an automatic closed-loop rollout until the action execution design is reviewed.
+
 ## Current Checkpoint
 
 Current local checkpoint path on the UR5 machine:
@@ -196,4 +216,3 @@ If later checkpoints exist, also test:
 ```
 
 Compare robot behavior rather than only training loss.
-
